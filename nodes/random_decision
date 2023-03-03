@@ -1,0 +1,242 @@
+#!/usr/bin/env python
+
+"""
+Randomized decision making
+    1. Collect feasible areas
+    2. Randomly select from those feasible areas
+        > With or without replacement?
+    3. Monitor that area
+"""
+import numpy as np
+import random as rd
+import rospy
+import actionlib
+from intermittent_monitoring.msg import visitAction, visitGoal
+from intermittent_monitoring.srv import flevel, flevelRequest
+from intermittent_monitoring.srv import location, locationRequest
+from intermittent_monitoring.srv import battery_level, battery_levelRequest
+from intermittent_monitoring.loss_fcns import *
+from intermittent_monitoring.cost_fcns import *
+
+def request_visit_feedback_cb(msg):
+    """
+    Feedback for action request to visit an area
+    :param msg:
+    :return:
+    """
+    print('Feedback received:', msg)
+
+def request_visit(robot_no, area):
+    """
+    Action request (to motion) to visit an area: either an area to monitor or a charging station.
+    If area monitor, request consists of visiting the area and restoring the F-measure.
+    But if a charging station, request consists of visiting the area and charging up the robot's battery.
+    :param area: Area to visit (either to monitor or charge up if charging station)
+    :return: True if request has been complied by robot (or motion)
+    """
+    client = actionlib.SimpleActionClient('visit_action_server_' + str(robot_no), visitAction)
+    client.wait_for_server()
+    goal = visitGoal()
+    goal.area = area
+    client.send_goal(goal, feedback_cb=request_visit_feedback_cb)
+    client.wait_for_result()
+    result = client.get_result()
+    return result
+
+def request_location(robot_no, msg=True):
+    """
+    Service request for current location of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("location_server_" + str(robot_no))
+    location_service = rospy.ServiceProxy("location_server_" + str(robot_no), location)
+    request = locationRequest(msg)
+    result = location_service(request)
+    # print("Received from server current location:", result.current_location)
+    return result.current_location
+
+#Service client: Requests battery level from motion
+def request_battery_level(robot_no, msg=True):
+    """
+    Service request for current battery level of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("battery_server_" + str(robot_no))
+    battery_service = rospy.ServiceProxy("battery_server_" + str(robot_no), battery_level)
+    request = battery_levelRequest(msg)
+    result = battery_service(request)
+    # print("Received from server current battery:", result.batt_level)
+    return result.batt_level
+def is_feasible(battery_level, battery_consumption):
+    """
+    If current battery level can cover batt_consumption to an area then back to the charging station.
+    :param battery_level: current battery level
+    :param battery_consumption: battery consumed to monitor an area then back to charging station
+    :return:
+    """
+    if battery_level >= battery_consumption:
+        return True
+    else:
+        return False
+
+def request_fmeasure(area, msg=True):
+    """
+    Service request for F-measure
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("flevel_server_" + str(area))
+    flevel_service = rospy.ServiceProxy("flevel_server_" + str(area), flevel)
+    request = flevelRequest(msg)
+    result = flevel_service(request)
+    # print("Received from server current Fmeasure:", result.current_fmeasure)
+    return result.current_fmeasure
+
+class RandomDecision():
+    def __init__(self, node_name, robot_no, areas, decay_rates, est_duration_matrix, est_batt_consumption_matrix, f_thresh):
+        """
+
+        :param node_name:
+        :param areas:
+        :param est_duration_matrix:
+        :param est_batt_consumption_matrix:
+        """
+        rospy.init_node(node_name)
+        self.robot_no = robot_no
+        self.areas = areas
+        self.decay_rates = decay_rates
+        self.est_duration_matrix = est_duration_matrix
+        self.est_batt_consumption_matrix = est_batt_consumption_matrix
+        self.charging_station = 0
+        self.max_fmeasure = 100
+        self.fsafe = f_thresh[0] #safe thresh
+        self.fcrit = f_thresh[1] #crit thresh
+
+    def choose_area_randomly(self, feasible_areas):
+        """
+        Chooses among feasible areas that have fallen below safe zone randomly
+        :param: feasible_areas (list): list of feasible areas
+        :return:
+        """
+
+        #If there are feasible areas that are in caution zone in the next decision step, pick randomly
+        if len(feasible_areas) > 0:
+            #pick randomly
+            return rd.choice(feasible_areas)
+        else: #We park at the charging station: either there are no feasible areas or all feasible areas are in safe zone
+            return self.charging_station
+
+    #NOTE: We can use compute_loss to find out whether an area will fall below the safe zone in the next decision step.
+
+    def compute_duration(self, start_area, next_area, curr_measure, restoration, noise):
+        """
+        Computes (time) duration of operation, which includes travelling distance plus restoration, if any
+        Furthermore, we include the battery consumed
+        :param distance:
+        :param restoration: restore a measure (if not None) back to full measure
+        :param noise: expected noise in distance travelled
+        :return:
+        """
+
+        # Travel distance
+        distance = self.est_distance_matrix[int(start_area), int(next_area)]
+        distance += noise * distance #distance + noise
+        time = (distance / self.robot_velocity)
+
+        #If next area is not the charging station: the restoration is the f-measure; else, the restoration is the battery level
+        if next_area != 0:
+            max_restore = self.max_fmeasure
+        else:
+            max_restore = self.max_battery
+
+        #Restoration time: If there is need for restoration
+        if (curr_measure is not None) and (restoration is not None):
+            restore_time = restoration * (max_restore - curr_measure)
+            time += restore_time
+
+        return time
+
+
+    def find_feasible_areas(self, curr_robot_loc, curr_batt_level):
+        """
+        Find feasible areas below the safe zone, if toggled
+        :return:
+        """
+        feasible_areas = list()
+        nodes = self.areas[:]
+        nodes.append(self.charging_station) #We add charging station as a node
+        for area in nodes:
+            est_batt_consumption = self.est_batt_consumption_matrix[curr_robot_loc, area] #This is just an approx. Would be better if we can compute duration
+
+            if area != self.charging_station:
+                fmeasure = float(request_fmeasure(area))
+                print("Area: {}. Fmeasure: {}".format(area, fmeasure))
+
+                #We can make this part more accurate by computing restoration
+                ## batt_consumption_restoration = restoration*(fmax - curr_fmeasure) * batt_consumption_restoration_perunit
+
+                est_duration = self.est_duration_matrix[curr_robot_loc, area]
+                loss = compute_loss(self.max_fmeasure, fmeasure, self.fsafe, self.fcrit, self.decay_rates[str(area)], est_duration)
+                print("Loss:", loss)
+            # If feasible and there will be loss in next decision step, we append
+            if is_feasible(curr_batt_level, est_batt_consumption) and (loss < 0):
+                feasible_areas.append(area)
+
+        return feasible_areas
+
+    def run_operation(self):
+        """
+        Among the feasible areas not yet assigned, pick randomly the next area to monitor
+        :return:
+        """
+        try:
+            while True:
+                robot_location = request_location(self.robot_no)
+                robot_battery = request_battery_level(self.robot_no)
+                print("Requesting battery", robot_battery)
+                feasible_areas = self.find_feasible_areas(robot_location, robot_battery)
+                print("Feasible areas:", feasible_areas)
+                chosen_area = self.choose_area_randomly(feasible_areas)
+                print("Chosen area:", chosen_area)
+                request_visit(self.robot_no, chosen_area)
+                print("Visit area requested")
+        except rospy.ROSInterruptException as e:
+            print('Something went wrong', e)
+
+if __name__ == '__main__':
+    #To-gather: motion. duration of travel. Yes. We indeed need a prior program that gathers the information on cost of operation.
+    #A matrix would be a better container for this one.
+    dist_matrix = np.array([[0, 10, 18, 15],
+                            [10, 0, 15, 18],
+                            [18, 15, 0, 10],
+                            [15, 18, 10, 0]])
+    robot_linear_velocity = 1.0
+    noise = 0.25
+    duration_matrix = (dist_matrix * robot_linear_velocity) * (1 + noise)
+
+    battery_consumption_moving_forward = 0.10 #potentially 0.001
+    battery_consumption_restoring_fmeasure = 0.25
+    batt_consumption_matrix = (duration_matrix * battery_consumption_moving_forward) + battery_consumption_restoring_fmeasure
+
+    decay_rates = {'1': 0.020, '2': 0.010, '3': 0.005}
+    f_thresh = (80, 50)
+    areas = [int(area) for area in list(decay_rates.keys())]
+    robot_no = 0
+    rd.seed(1234)
+    RandomDecision('random_decision', robot_no, areas, decay_rates, duration_matrix, batt_consumption_matrix, f_thresh).run_operation()
+
+    # duration_matrix = np.array([[0, 13.978, 33.8757, 47.92],
+    #                           [17.521, 0, 27.4774, 48.695],
+    #                           [33.827, 22.955, 0, 49.973],
+    #                           [57.22, 49.53, 56.535, 0]])
+    #
+    # #To-gather: motion. batt_consumption
+    # batt_consumption_matrix = np.array([[0, 15.749, 37.85, 52.15],
+    #                                   [20.1, 0, 31.45, 53.05],
+    #                                   [37.6, 26.65, 0, 54.85],
+    #                                   [61.1, 53.45, 60.85, 0]])
+
+
+

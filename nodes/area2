@@ -1,0 +1,9 @@
+#!/usr/bin/env python
+
+import rospy
+from intermittent_monitoring.area import *
+
+if __name__ == '__main__':
+    area = Area(area=2, max_fmeasure=100, decay_rate=0.010, restoration=0.10, t_operation=1000)
+    area.run_operation()
+    rospy.spin()

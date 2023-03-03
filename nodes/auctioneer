@@ -1,0 +1,257 @@
+#!/usr/bin/env python
+
+import rospy
+import actionlib
+from intermittent_monitoring.msg import visitAction, visitGoal
+from intermittent_monitoring.srv import area_assignment, area_assignmentRequest
+from intermittent_monitoring.srv import assignment_notice, assignment_noticeRequest
+from intermittent_monitoring.srv import flevel, flevelRequest
+from intermittent_monitoring.srv import bid_area, bid_areaRequest
+from intermittent_monitoring.srv import robot_availability, robot_availabilityRequest
+
+"""
+The auctioneer auctions each unassigned area sequentially by urgency, assigning to the robot that has bid the minimum loss 
+    among the available robots.
+
+Inputs:
+1. List of robots and areas
+
+Process: Goes through an indefinite loop (or could also be finite time period) where are unassigned areas are bid to 
+available robots
+1. Get unassigned areas, sorting them by urgency
+    > Urgency function: the current loss plus expected loss (approx. by the average duration to that node times the marginal loss)
+2. Get available robots
+3. While there is an unassigned area and available robot:
+    i. Auction most urgent place
+    ii. Assign robot with lowest bid (on loss)
+    iii. Remove auctioned place from unassigned areas
+    iv. Remove assigned robot from available robots
+
+"""
+
+def request_fmeasure(area, msg=True):
+    """
+    Service request for F-measure
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("flevel_server_" + str(area))
+    flevel_service = rospy.ServiceProxy("flevel_server_" + str(area), flevel)
+    request = flevelRequest(msg)
+    result = flevel_service(request)
+    # print("Received from server current Fmeasure:", result.current_fmeasure)
+    return result.current_fmeasure
+
+def assign_area(robot_no, area):
+    """
+    Assignment (or awarding) of an area to winner robot in bid
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("area_assignment_server_" + str(robot_no))
+    assign_service = rospy.ServiceProxy("area_assignment_server_" + str(robot_no), area_assignment)
+    request = area_assignmentRequest(area)
+    result = assign_service(request)
+    print("Assignment of robot {} to Area {}: {}".format(robot_no, area, result.acceptance))
+
+def ask_bid(area, robot_no):
+    """
+    Service client to Robot: Asks for bid given area.
+    :param area:
+    :return:
+    """
+    rospy.wait_for_service("bid_area_server_" + str(robot_no))
+    bid_service = rospy.ServiceProxy("bid_area_server_" + str(robot_no), bid_area)
+    request = bid_areaRequest(area)
+    result = bid_service(request)
+    # print("Received from server current Fmeasure:", result.current_fmeasure)
+    return result.bid
+
+def send_notice_of_assignment(area):
+    """
+    Service client to Area: Sends notice of assignment to area
+    :param area:
+    :return:
+    """
+    rospy.wait_for_service("assignment_notice_server_" + str(area))
+    notice_service = rospy.ServiceProxy("assignment_notice_server_" + str(area), assignment_notice)
+    request = assignment_noticeRequest(True)
+    result = notice_service(request)
+    print("Notice of Area {} assignment accepted: {}".format(area, bool(result.acceptance)))
+
+def request_availability(robot_no):
+    """
+    Service client for requesting availability of robot
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("robot_availability_server_" + str(robot_no))
+    availability_service = rospy.ServiceProxy("robot_availability_server_" + str(robot_no), robot_availability)
+    request = robot_availabilityRequest(True)
+    result = availability_service(request)
+    #print("Robot {} availability: {}".format(robot_no, bool(result.availability)))
+    return result.availability
+
+
+class Auctioneer():
+    def __init__(self, node_name, robots, areas):
+        rospy.init_node(node_name)
+        self.robots = robots #list
+        self.areas = areas #list
+        self.unassigned_areas = self.areas[:] #list
+        self.available_robots = self.robots[:] #list
+
+    def get_available_robots(self):
+        """
+        Gets available robots
+        :return:
+        """
+        available_robots = list()
+        for robot in self.robots:
+            available = request_availability(robot)
+            #print("Availability result:", available)
+            if available is True:
+                available_robots.append(robot)
+        #print("Available robots:", available_robots)
+        return available_robots
+
+    def get_unassigned_areas(self):
+        unassigned_areas = dict()
+        for area in self.areas:
+            fmeasure = request_fmeasure(area)
+            #print("Area:", type(fmeasure), fmeasure)
+            if fmeasure != 'None':
+                unassigned_areas[str(area)] = float(fmeasure)
+        #print("Unassigned areas:", unassigned_areas)
+        return unassigned_areas
+
+    #Make this moment holy, my God.
+
+    # def get_available_robots(self):
+    #     """
+    #     Perhaps there is no need for the
+    #     :return:
+    #     """
+    #     pass
+
+    def compute_urgency(self, unassigned_areas):
+        """
+        Computes urgency of areas based on their (PO:) F-measures, slope of loss, and average duration to that area from all other areas
+        :param area:
+        :return:
+        """
+        # Get unassigned areas
+        # Compute urgency:
+            #Basic: Just the F-measure, sorted from most decayed to least
+            #Comlex: F-measure plus expected loss over time
+        # Sort
+        sorted_areas = sorted(unassigned_areas.items(), key=lambda x: x[1], reverse=False)
+        #print("Sorted areas:", sorted_areas)
+
+        # Collect the areas, these have been sorted by urgency
+        areas_by_urgency = list()
+        for item in sorted_areas:
+            area = int(item[0])
+            areas_by_urgency.append(area)
+        return areas_by_urgency
+
+    def collect_bids(self, area, available_robots):
+        """
+        Collects bids to monitor given area from robots. Has option whether bids are to be sorted.
+        :param area:
+        :return:
+        """
+        bids = dict()
+        for robot in available_robots:
+            #print("Collecting bid:", robot)
+            bid = ask_bid(area, robot)
+            #print("Collected bid:", bid)
+            bids[str(robot)] = float(bid)
+        bids = sorted(bids.items(), key=lambda x: x[1], reverse=False)
+        return bids
+
+    """
+    def run_operation(self):
+        while True:
+            get unassigned areas
+            sort these unassigned areas
+            for area in sorted unassigned areas:
+                bids = get_bids(robots, area)
+                assign(area, lowest bidder)
+                Notice assignment area
+    Version 2.0
+    def run_operation(self):
+        while True:
+            unassigned_areas = get_fmeasures() #Get F-measures of unassigned areas
+                > area.py: report_flevel_cb; self.assigned_to_bidder
+            urgency = compute_urgency(unassigned_areas) #Simple: F-measure. Complex: F-measure + Expected loss
+            sort unassigned_areas by urgency
+                > auctioneer: compute_urgency
+                
+            #UPNEXT:
+            for area in unassigned_areas:
+                bids = get_bids(area)
+                    > auctioneer: collect_bids
+                assign area to lowest bidder
+                    > awarded_robot = bids[0][0]
+                    > auctioneer: assign_area(area, awarded_robot)
+                send notice to area that it has been assigned
+                    > auctioneer (client): notice_of_assignment() [server: respective area]
+    """
+    #UPNEXT: Fill up the missing pieces (DONE!). FIND OUT MILLION PESO QUESTION, QUICK AND DIRTY WAY!
+    #Goal: Find out whether by service server we can do the task allocation/assignment almost simultaneously
+    #That is, we no longer wait for the next result.
+    #DONE! THIS WORKS!
+    # def quick_n_dirty(self):
+    #     print("Assigning Robot 1 to Area 1")
+    #     assign_area(1, 1)
+    #     print("Assigning Robot 2 to Area 0")
+    #     assign_area(2, 0)
+
+
+    #UPNEXT: Make this program work! Find out the result!
+    def run_operation(self, eps):
+        rate = rospy.Rate(1)
+        while True:
+            #Missing piece: Available robots
+            print("\nGetting available robots")
+            available_robots = self.get_available_robots() #Gets available robots
+            print("Available robots:", available_robots)
+            if len(available_robots) > 0:
+                areas_for_bidding = self.get_unassigned_areas()
+                print("Areas for bidding:", areas_for_bidding)
+
+                urgency_areas_for_bidding = self.compute_urgency(areas_for_bidding)
+                print("Sorted areas for bidding:", urgency_areas_for_bidding)
+
+                for area in urgency_areas_for_bidding:
+                    print("Sending bids for area", area)
+                    bids = self.collect_bids(area, available_robots)
+                    print("Bids collected:", bids)
+
+                    if bids[0][1] < eps:
+                        winner_bidder = int(bids[0][0]) #lowest bidder
+                        print("Awarded bidder", winner_bidder)
+
+                        print("Send notice of assignment")
+                        send_notice_of_assignment(area)
+
+                        print("Assign area to winner")
+                        assign_area(winner_bidder, area)
+                        available_robots.remove(winner_bidder) #Removes awarded bidder from available robots
+
+                        if len(available_robots) == 0:
+                            print("Currently no available robots")
+                            break
+                    else:
+                        print("No winning bid")
+                    rate.sleep()
+                print("Auction done.")
+            else:
+                print("Currently no area for auction")
+
+            rate.sleep()
+
+if __name__ == '__main__':
+    auctioneer = Auctioneer("auctioneer", robots=[1, 2], areas=[1, 2, 3])
+    auctioneer.run_operation(eps=-0.000001)

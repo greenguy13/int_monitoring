@@ -1,0 +1,13 @@
+#!/usr/bin/env python
+
+from intermittent_monitoring.monitor_stats import *
+
+if __name__ == '__main__':
+    areas = [1, 2, 3]
+    robots = [0]
+    stats_listener = StatsListener(areas=areas, robots=robots, sleep=10)
+    filename = 'random_stats.pkl'
+    print("Listening to F-measure of Areas: {}. Battery of robots: {}".format(areas, robots))
+    result = stats_listener.save_recorded_array(t_operation=2000, filename=filename)
+    print("Stored data:", result)
+    #rospy.spin()

@@ -1,0 +1,3 @@
+bool location_request
+---
+int8 current_location

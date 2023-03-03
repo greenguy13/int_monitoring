@@ -1,0 +1,323 @@
+#!/usr/bin/env python
+
+"""
+Steady-state algo
+
+Inputs/requests:
++ Odom (from motion node)? Could be the self.location. A message of where the robot is.
++ Current F-measure (from fmeasure node)
++ WORK: Current battery level (from motion)
+
+Process:
++ compute feasibility of a node/area
++ compute loss function
++ compute cost function
++ ordering of areas
++ allocation of waypoint
+
+Output:
++ waypoint to a robot (to motion node) [or location]
+
+Tutorial acknowledgments:
+https://www.theconstructsim.com/ros-5-mins-035-create-ros-action-client/
+"""
+
+"""
+UPNEXT (NOV 11, 2022):
+1. Update node/server/client dependencies
+"""
+
+
+import numpy as np
+import rospy
+import actionlib
+from intermittent_monitoring.msg import visitAction, visitGoal
+from intermittent_monitoring.srv import flevel, flevelRequest
+from intermittent_monitoring.srv import location, locationRequest
+from intermittent_monitoring.srv import battery_level, battery_levelRequest
+from intermittent_monitoring.loss_fcns import *
+from intermittent_monitoring.cost_fcns import *
+
+def request_visit_feedback_cb(msg):
+    """
+    Feedback for action request to visit an area
+    :param msg:
+    :return:
+    """
+    print('Feedback received:', msg)
+
+def request_visit(robot_no, area):
+    """
+    Action request (to motion) to visit an area: either an area to monitor or a charging station.
+    If area monitor, request consists of visiting the area and restoring the F-measure.
+    But if a charging station, request consists of visiting the area and charging up the robot's battery.
+    :param area: Area to visit (either to monitor or charge up if charging station)
+    :return: True if request has been complied by robot (or motion)
+    """
+    client = actionlib.SimpleActionClient('visit_action_server_' + str(robot_no), visitAction)
+    client.wait_for_server()
+    goal = visitGoal()
+    goal.area = area
+    client.send_goal(goal, feedback_cb=request_visit_feedback_cb)
+    client.wait_for_result()
+    result = client.get_result()
+    return result
+
+def request_fmeasure(area, msg=True):
+    """
+    Service request for F-measure
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("flevel_server_" + str(area))
+    flevel_service = rospy.ServiceProxy("flevel_server_" + str(area), flevel)
+    request = flevelRequest(msg)
+    result = flevel_service(request)
+    # print("Received from server current Fmeasure:", result.current_fmeasure)
+    return result.current_fmeasure
+
+def request_location(robot_no, msg=True):
+    """
+    Service request for current location of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("location_server_" + str(robot_no))
+    location_service = rospy.ServiceProxy("location_server_" + str(robot_no), location)
+    request = locationRequest(msg)
+    result = location_service(request)
+    # print("Received from server current location:", result.current_location)
+    return result.current_location
+
+#Service client: Requests battery level from motion
+def request_battery_level(robot_no, msg=True):
+    """
+    Service request for current battery level of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("battery_server_" + str(robot_no))
+    battery_service = rospy.ServiceProxy("battery_server_" + str(robot_no), battery_level)
+    request = battery_levelRequest(msg)
+    result = battery_service(request)
+    # print("Received from server current battery:", result.batt_level)
+    return result.batt_level
+
+
+"""
+What we have here now are ingredients for the algorithm:
+1. Current F-measure
+2. Current battery level
+3. Current location of the robots
+
+What we will need:
+1. Given the current F-measure, measure the loss for the next decision step.
+2. Given the current battery level, determine whether going to an area in the next decision step is feasible
+
+This then suggest that we have a sense on the (average) duration it would take to visit an area from current area.
+This duration would include the drop in F-measure and the battery consumption.
+To measure this duration, we need to measure:
+ a. How long it takes,
+ b. Battery consumed,
+ c. Drop in F-measure
+"""
+
+#UPNEXT: Decision making algorithm
+##Loss function (script)
+##Cost function (script)
+##Algorithm (script)
+
+def is_feasible(battery_level, battery_consumption):
+    """
+    If current battery level can cover batt_consumption to an area then back to the charging station.
+    :param battery_level: current battery level
+    :param battery_consumption: battery consumed to monitor an area then back to charging station
+    :return:
+    """
+    if battery_level >= battery_consumption:
+        return True
+    else:
+        return False
+
+#loss(decayed_fmeasure, rate, rates, est_duration)
+#cost(batt_consumption)
+def steady_state_component(feasible, loss, cost):
+    """
+    Computes steady-state components
+    :return:
+    """
+    component = feasible * (loss / (cost+1))
+    return component
+
+class SteadyStateAlgo():
+    def __init__(self, node_name, areas, decay_rates, est_duration_dict, est_batt_consumption_dict):
+        """
+
+        :param areas: list of areas
+        :param decay_rates: dict of decay rates per area
+        """
+        rospy.init_node(node_name)
+        self.areas = areas
+        self.decay_rates = decay_rates
+        self.est_duration_dict = est_duration_dict
+        self.est_batt_consumption_dict = est_batt_consumption_dict
+
+    def request_fmeasures(self):
+        """
+        Request fmeasures of areas
+        :return:
+        """
+        fmeasures = dict()
+        for area in self.areas:
+            fmeasures[str(area)] = request_fmeasure(area)
+        return fmeasures
+
+    def compute_losses(self, curr_robot_loc):
+        """
+        Computes losses of areas
+        :param areas:
+        :return:
+        """
+        # My heart is Yours.
+
+        fmeasures = self.request_fmeasures()
+        losses = dict()
+        for area in self.areas:
+            est_duration = self.est_duration_dict[curr_robot_loc, area]
+            losses[str(area)] = compute_loss(fmeasures[str(area)], self.decay_rates[str(area)], list(self.decay_rates.values()), est_duration)
+
+        return losses
+
+    def compute_costs(self, curr_robot_loc):
+        """
+        Computes costs of areas
+        :param areas:
+        :return:
+        """
+        costs = dict()
+        for area in self.areas:
+            est_batt_consumption = self.est_batt_consumption_dict[curr_robot_loc, area]
+            costs[str(area)] = compute_cost(est_batt_consumption)
+        return costs
+
+    def is_feasible_dict(self, curr_robot_loc, curr_batt_level):
+        """
+        For each area to potentially monitor, determine whether it is feasible given current battery level of robot
+        :return:
+        """
+        feasible_dict = dict()
+        for area in self.areas:
+            est_batt_consumption = self.est_batt_consumption_dict[curr_robot_loc, area]
+            feasible_dict[str(area)] = is_feasible(curr_batt_level, est_batt_consumption)
+
+        return feasible_dict
+
+    def compute_SS_components(self, curr_robot_loc, curr_batt_level):
+        """
+        Compute steady-state components for each area
+        :return:
+        """
+
+        losses = self.compute_losses(curr_robot_loc)
+        costs = self.compute_costs(curr_robot_loc)
+        feasible_dict = self.is_feasible_dict(curr_robot_loc, curr_batt_level)
+        SS_components = dict()
+        for area in self.areas:
+            SS_components[str(area)] = feasible_dict[str(area)] * (losses[str(area)] / (costs[str(area)] + 1))
+
+        return SS_components
+
+    def run_operation(self, eps):
+        """
+        Run steady state algorithm
+        :param: eps - small negative number to account for rounding errors
+        :return:
+        """
+        try:
+            while True:
+                # Get current F-measure, Batt level
+                curr_batt_level = request_battery_level() #Need to fix: curr_batt_level, curr_robot_loc
+                curr_robot_loc = request_location()
+                SS_components = self.compute_SS_components(curr_robot_loc, curr_batt_level)
+
+                #Sort SS components
+                SS_components = sorted(SS_components.items(), key=lambda x: x[1], reverse=False)
+                print("Sorted components:", SS_components)
+                if SS_components[0][1] < eps:
+                    area = int(SS_components[0][0])
+                else:
+                    area = 0
+
+                request_visit(area)
+
+        except rospy.ROSInterruptException as e:
+            print('Something went wrong', e)
+
+# def steady_state_algorithm(given_area, est_duration_dict, est_batt_consumption_dict, eps):
+#     """
+#     Steady state algorithm
+#     :param: given_area
+#     :return: area to visit in the next decision step
+#     """
+#
+#     while True:
+#         # Get current F-measure, Batt level
+#         current_fmeasure = request_fmeasure()
+#         curr_batt_level = request_battery_level()
+#         curr_location = request_location()
+#
+#         # Measure Loss
+#         est_duration = est_duration_dict[str(curr_location) + str(given_area)] #estimated duration
+#         loss = compute_loss(current_fmeasure, rate=0.02, rates=[0.02], est_duration=est_duration)
+#
+#         # Measure cost
+#         est_batt_consumption = est_batt_consumption_dict[str(curr_location) + str(given_area)] #estimated battery consumption
+#         cost = compute_cost(est_batt_consumption)
+#
+#         # Measure is_feasible
+#         feasible = is_feasible(curr_batt_level, cost)
+#
+#         # In a nutshell, measure component
+#         component = steady_state_component(feasible, loss, cost)
+#         print("Computed component:", component)
+#         if component < eps:
+#             area = given_area #monitor given area
+#         else:
+#             area = 0 #charging station
+#
+#         request_visit(area)
+
+# if __name__ == '__main__':
+#     rospy.init_node("decision_making")
+
+
+if __name__ == '__main__':
+    #To-gather: motion. duration of travel. Yes. We indeed need a prior program that gathers the information on cost of operation.
+    #A matrix would be a better container for this one.
+    dict_duration = np.array([[0, 13.978, 33.8757, 47.92],
+                              [17.521, 0, 27.4774, 48.695],
+                              [33.827, 22.955, 0, 49.973],
+                              [57.22, 49.53, 56.535, 0]])
+
+    #To-gather: motion. batt_consumption
+    dict_batt_consumption = np.array([[0, 15.749, 37.85, 52.15],
+                                      [20.1, 0, 31.45, 53.05],
+                                      [37.6, 26.65, 0, 54.85],
+                                      [61.1, 53.45, 60.85, 0]])
+
+    areas = [1, 2, 3]
+    decay_rates = {'1': 0.020, '2': 0.010, '3': 0.005}
+
+    SteadyStateAlgo('decision_making', areas, decay_rates, dict_duration, dict_batt_consumption).run_operation(eps=-0.0001)
+
+
+    #ANOTHER PARTS: SCRIPT. Create nodes for f-measures 1, 2, 3 (Areas) DONE
+    """
+    UPNEXT:
+    0. Provide parameters: dict_duration, dict_batt_consumption, decay_rates DONE
+    1. Edit CMakeList
+    2. Edit roslaunch
+    3. Catkin_make
+    4. Verify decision_making
+    5. Do the simulation
+    """

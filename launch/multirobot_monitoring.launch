@@ -1,0 +1,60 @@
+
+<!--
+MAP:
+> Starting locations of robots
+
+NODES
+> Areas: area1, area2, area3
+> Charging station: charging_station
+> Robots: robot1, robot2
+> Auctioneer: auctioneer
+> Monitor F-measure: monitor_fmeasure1, monitor_fmeasure2, monitor_fmeasure3
+> Monitor battery level: monitor_battery1, monitor_battery2
+-->
+
+<launch>
+  <!--
+       Using simulation time means nodes initialized after this
+       will not use the system clock for its ROS clock and
+       instead wait for simulation ticks.
+       See http://wiki.ros.org/Clock
+       Note: set to false for deploying to a real robot.
+  -->
+  <arg name="use_sim_time" default="true"/>
+  <param name="use_sim_time" value="$(arg use_sim_time)"/>
+
+  <node pkg="intermittent_monitoring" type="area1" name="area1" output="screen"/>
+  <node pkg="intermittent_monitoring" type="area2" name="area2" output="screen"/>
+  <node pkg="intermittent_monitoring" type="area3" name="area3" output="screen"/>
+
+  <node pkg="intermittent_monitoring" type="robot0" name="robot0" output="screen"/>
+  <node pkg="intermittent_monitoring" type="robot1" name="robot1" output="screen"/>
+
+  <node pkg="intermittent_monitoring" type="charging_station" name="charging_station" output="screen"/>
+
+  <node pkg="intermittent_monitoring" type="auctioneer" name="auctioneer" output="screen"/>
+
+</launch>
+
+<!-- More information on ROS launch http://wiki.ros.org/roslaunch/XML -->
+
+<launch>
+  <!--
+       Using simulation time means nodes initialized after this
+       will not use the system clock for its ROS clock and
+       instead wait for simulation ticks.
+       See http://wiki.ros.org/Clock
+       Note: set to false for deploying to a real robot.
+  -->
+  <arg name="use_sim_time" default="true"/>
+  <param name="use_sim_time" value="$(arg use_sim_time)"/>
+
+  <node pkg="intermittent_monitoring" type="area1" name="area1" output="screen"/>
+  <node pkg="intermittent_monitoring" type="area2" name="area2" output="screen"/>
+  <node pkg="intermittent_monitoring" type="area3" name="area3" output="screen"/>
+
+  <node pkg="intermittent_monitoring" type="motion" name="motion_server" output="screen"/>
+  <node pkg="intermittent_monitoring" type="charging_station" name="charging_station" output="screen"/>
+  <node pkg="intermittent_monitoring" type="decision_making" name="decision_making" output="screen"/>
+
+</launch>

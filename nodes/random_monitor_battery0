@@ -1,0 +1,25 @@
+#!/usr/bin/env python
+
+"""
+[WORK]
+Inputs:
+1. Receives battery level from motion
+
+Process:
+> Monitors the battery levels from motion and stores in an array
+
+Outputs:
+> Possibly a graph of battery levels throughout the duration of the operation
+
+"""
+
+from intermittent_monitoring.monitor_battery import *
+
+if __name__ == '__main__':
+    robot_no = 0
+    battery_listener = BatteryLevelListener(robot_no, sleep=5)
+    filename = 'random_battery_robot' + str(robot_no) + '.pkl'
+    print("Listening to battery: Robot " + str(robot_no))
+    result = battery_listener.save_recorded_array(t_operation=100, filename=filename)
+    print("Stored batt data:", result)
+    #rospy.spin()

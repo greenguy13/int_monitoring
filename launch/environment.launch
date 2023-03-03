@@ -1,0 +1,18 @@
+<launch>
+  <!--
+       Using simulation time means nodes initialized after this
+       will not use the system clock for its ROS clock and
+       instead wait for simulation ticks.
+       See http://wiki.ros.org/Clock
+       Note: set to false for deploying to a real robot.
+  -->
+  <arg name="use_sim_time" default="true"/>
+  <param name="use_sim_time" value="$(arg use_sim_time)"/>
+
+  <node pkg="intermittent_monitoring" type="area1" name="area1" output="screen"/>
+  <node pkg="intermittent_monitoring" type="area2" name="area2" output="screen"/>
+  <node pkg="intermittent_monitoring" type="area3" name="area3" output="screen"/>
+  <node pkg="intermittent_monitoring" type="charging_station" name="charging_station" output="screen"/>
+  <node pkg="intermittent_monitoring" type="robot0" name="robot0" output="screen"/>
+
+</launch>

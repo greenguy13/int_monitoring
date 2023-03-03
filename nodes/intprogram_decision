@@ -1,0 +1,363 @@
+#!/usr/bin/env python
+
+"""
+Integer programming decision making
+"""
+
+import time
+import numpy as np
+import rospy
+import actionlib
+from intermittent_monitoring.msg import visitAction, visitGoal
+from intermittent_monitoring.srv import flevel, flevelRequest
+from intermittent_monitoring.srv import location, locationRequest
+from intermittent_monitoring.srv import battery_level, battery_levelRequest
+from intermittent_monitoring.loss_fcns import *
+from intermittent_monitoring.cost_fcns import *
+from intermittent_monitoring.pruning import *
+import gurobipy as gp
+from gurobipy import *
+
+def request_battery_level(robot_no, msg=True):
+    """
+    Service request for current battery level of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("battery_server_" + str(robot_no))
+    battery_service = rospy.ServiceProxy("battery_server_" + str(robot_no), battery_level)
+    request = battery_levelRequest(msg)
+    result = battery_service(request)
+    # print("Received from server current battery:", result.batt_level)
+    return result.batt_level
+
+
+def request_fmeasure(area, msg=True):
+    """
+    Service request for F-measure
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("flevel_server_" + str(area))
+    flevel_service = rospy.ServiceProxy("flevel_server_" + str(area), flevel)
+    request = flevelRequest(msg)
+    result = flevel_service(request)
+    # print("Received from server current Fmeasure:", result.current_fmeasure)
+    return result.current_fmeasure
+
+
+def request_location(robot_no, msg=True):
+    """
+    Service request for current location of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("location_server_" + str(robot_no))
+    location_service = rospy.ServiceProxy("location_server_" + str(robot_no), location)
+    request = locationRequest(msg)
+    result = location_service(request)
+    # print("Received from server current location:", result.current_location)
+    return result.current_location
+
+
+def request_visit_feedback_cb(msg):
+    """
+    Feedback for action request to visit an area
+    :param msg:
+    :return:
+    """
+    print('Feedback received:', msg)
+
+
+def request_visit(robot_no, area):
+    """
+    Action request (to motion) to visit an area: either an area to monitor or a charging station.
+    If area monitor, request consists of visiting the area and restoring the F-measure.
+    But if a charging station, request consists of visiting the area and charging up the robot's battery.
+    :param area: Area to visit (either to monitor or charge up if charging station)
+    :return: True if request has been complied by robot (or motion)
+    """
+    client = actionlib.SimpleActionClient('visit_action_server_' + str(robot_no), visitAction)
+    client.wait_for_server()
+    goal = visitGoal()
+    goal.area = area
+    client.send_goal(goal, feedback_cb=request_visit_feedback_cb)
+    client.wait_for_result()
+    result = client.get_result()
+    return result
+
+
+class IntegerProgrammingDecision():
+    def __init__(self, node_name, decay_rates_dict, distance_matrix, robot_no, robot_velocity, batt_consumed_per_time, f_thresh):
+        """
+
+        :param node_name:
+        :param areas:
+        :param est_distance_matrix:
+        :param est_batt_consumption_matrix:
+        """
+        rospy.init_node(node_name)
+        self.areas = list(decay_rates_dict.keys())
+        global cast
+        cast = type(self.areas[0])
+        self.charging_station = cast(0)  # charging station area index
+
+        self.decay_rates_dict = decay_rates_dict  # Decay rate of areas
+        self.dist_matrix = distance_matrix #Distance matrix
+        self.average_dist2_node_matrix = self.average_dist2_node() #Matrix of average distances to a node from every other node
+        # self.est_batt_consumption_matrix = est_batt_consumption_matrix
+        #self.max_distance = np.max(self.est_distance_matrix)  # Max distance between two areas
+        self.robot_no = robot_no
+        self.robot_velocity = robot_velocity  # Linear velocity of robot; we assume linear and angular are relatively equal
+
+        self.fsafe = f_thresh[0] #safe threshold
+        self.fcrit = f_thresh[1] #crit threshold
+
+        self.max_fmeasure = 100  # Max F-measure of an area
+        #self.max_battery = 100  # Max battery
+
+        # We can make this more accurate by having battery consumption per unit time for the travel distance and then another for the restoration
+        self.batt_consumed_travel_unit = batt_consumed_per_time[0]
+        self.batt_consumed_restore_unit = batt_consumed_per_time[1]
+
+    def average_dist2_node(self):
+        """
+        Computes the average distance to a node from every other node
+        :return:
+        """
+        return np.mean(self.dist_matrix, axis=0)
+
+    def compute_duration(self, distance, curr_measure, restoration):
+        """
+        Computes duration of a mission to an area, which includes time to travel to the area given velocity, plus restoration
+        (whether to charge up battery or restore F-measure)
+        """
+        duration_travel = distance / self.robot_velocity
+        duration_restoration = restoration * (self.max_fmeasure - curr_measure)
+        duration = duration_travel + duration_restoration
+        return duration
+
+    def average_feasible_battery_consumption(self, restoration):
+        """
+        Average battery consumption in monitoring an area taking into feasibility in going back to the charging station
+        :param restoration:
+        :return:
+        """
+        ave_travel_consume = (np.mean(self.dist_matrix) / self.robot_velocity) * self.batt_consumed_travel_unit #Average battery consumption in travel
+        ave_restoration = restoration * (self.max_fmeasure / 2) * self.batt_consumed_restore_unit #Average consumption in restoring F-measure
+        ave_feasible_batt_consumption = ave_travel_consume + ave_restoration + self.average_dist2_node_matrix[int(self.charging_station)] #Average feasible battery consumption, (i.e., travel to area, restore F, then back to charging station)
+
+        return ave_feasible_batt_consumption
+
+    def collect_current_fmeasures(self):
+        """
+        Collect current F-measures
+        :return:
+        """
+        fmeasures = dict()  # F-measures of areas
+        print("Areas:", self.areas)
+        for area in self.areas:
+            fmeasures[area] = float(request_fmeasure(area))
+
+        return fmeasures
+
+    def curr_time_given_decayed_fmeasures(self, fmeasures):
+        """
+        Gets current time of each area given decayed F-measure
+        :param fmeasures:
+        :return:
+        """
+        curr_time = list()
+        for i in range(len(self.areas)):
+            area = self.areas[i]
+            curr_time.append(get_time_given_decay(self.max_fmeasure, fmeasures[area], self.decay_rates_dict[area]))
+
+        return curr_time
+
+    def determine_decision_steps(self, battery, dec_steps, restoration):
+        """
+        Determines the number of decision steps, wherein the range is [0, len(areas)]
+        :return:
+        """
+        dec_steps = min(dec_steps, int(battery // self.average_feasible_battery_consumption(restoration)), len(self.areas))
+        return dec_steps
+
+    def approx_area_losses(self, dec_steps, restoration):
+        """
+        We approximate loss per area across decision steps
+        :return:
+        """
+
+        current_fmeasures = self.collect_current_fmeasures()
+
+        losses = list()
+        for i in range(len(self.areas)):
+            losses.append([])
+
+        for i in range(len(self.areas)):
+            area = self.areas[i]
+            print("\nArea:", area)
+            for dec_step in range(dec_steps):
+                distance = (dec_step+1) * self.average_dist2_node_matrix[i+1] #dec_step+1 so that multiplier>0; i+1 to skip i=0, the charging station
+                duration = self.compute_duration(distance, current_fmeasures[area], restoration)
+                loss = compute_loss(self.max_fmeasure, current_fmeasures[area], self.fsafe, self.fcrit, self.decay_rates_dict[area], duration)
+                print("Dec. step: {}. Distance: {}. Duration: {}. Loss: {}.".format(dec_step+1, distance, duration, loss))
+                losses[i].append(loss)
+
+        losses = np.array(losses)
+        return losses
+
+    def solve_model(self, dec_steps, restoration):
+        """
+
+        :return:
+        """
+        solution = list()
+        solution.append(request_location(self.robot_no)) #First element of the path is the robot's current location
+
+        #Set up the IP model
+        m = gp.Model()
+
+        #Constants
+        battery = request_battery_level(self.robot_no)
+        dec_steps = self.determine_decision_steps(battery, dec_steps, restoration)
+
+        print("Gurobi running...")
+        if dec_steps > 0:
+            losses = self.approx_area_losses(dec_steps, restoration)
+
+            #Decision variables
+            decision_vars = list()
+            for i in range(len(self.areas)):
+                decision_vars.append([])
+
+            for i in range(len(self.areas)):
+                for d in range(dec_steps):
+                    decision_vars[i].append(m.addVar(vtype=GRB.INTEGER, name='a' + str(self.areas[i]) + 'd' + str(d)))
+            decision_vars = np.array(decision_vars)
+
+            # Objective function
+            objective = np.sum(losses * decision_vars)
+            m.setObjective(objective, GRB.MINIMIZE)
+
+            # Constraints
+            ##For each area, we can visit that at most once
+            for i in range(len(self.areas)):
+                m.addConstr(0 <= np.sum(decision_vars, axis=1)[i])
+                m.addConstr(np.sum(decision_vars, axis=1)[i] <= 1)
+
+            ##For each decision step, there should be only one area assignment
+            for d in range(dec_steps):
+                m.addConstr(np.sum(decision_vars, axis=0)[d] == 1)
+
+            ##All decision assignments should equal to the number of decision steps,
+            ## i.e., at each decision step we have one assignment
+            m.addConstr(np.sum(decision_vars) == dec_steps)
+
+            ##Each area can be assigned or not at a given decision step, i.e., its value is either 0 or 1
+            for i in range(len(self.areas)):
+                for d in range(dec_steps):
+                    m.addRange(decision_vars[i][d], 0, 1)
+
+            # Optimize the model
+            m.optimize()
+
+            # Print out the result
+            # Retrieve the result
+            result = np.zeros(shape=decision_vars.shape)
+            for i in range(len(self.areas)):
+                for d in range(dec_steps):
+                    print(decision_vars[i][d])
+                    result[i][d] = int(decision_vars[i][d].X)
+            print("Result:", result)
+
+            # We retrieve the optimal decision: monitor an area
+            for step in range(dec_steps):
+                print("Result:", result[:, step], np.where(result[:, step] == 1), np.where(result[:, step] == 1)[0][0])
+                opt_area = np.where(result[:, step] == 1)[0][0]
+                solution.append(opt_area+1)  # adjust area index: +1
+
+        # Else: there is no more feasible decision, we go back to the charging station.
+        else:
+            solution.append(self.charging_station)
+
+        return solution
+
+    def run_operation(self, dec_steps, restoration):
+        """
+        Among the feasible areas, pick randomly the next area to monitor
+        :return:
+        """
+        try:
+            while True:
+                st = time.time()
+                time.sleep(1)
+                optimal_path = self.solve_model(dec_steps, restoration)
+                opt_path_et = time.time()
+
+                print("Optimal path:", optimal_path)
+                print("Wall time (secs):".format(opt_path_et - st))
+
+                # NOTE: The path stores the root. And so the first element should not be included as an action goal
+                for step in range(len(optimal_path) - 1):
+                    area = optimal_path[step + 1]
+                    print("Requested visit:", area)
+                    request_visit(self.robot_no, int(area))
+
+                    # Request F-measure here
+                    # We then store the results. My concern here is that there may be a delay, and so we may not be able to capture when F=100.
+                    # The safest would then be to have an F-measure listener.
+                    # Actually, I am thinking we insert the F-measure listener here. This way, this could kill the run_operation
+
+        except rospy.ROSInterruptException as e:
+            print('Something went wrong', e)
+
+
+if __name__ == '__main__':
+    # To-gather: motion. duration of travel. Yes. We indeed need a prior program that gathers the information on cost of operation.
+    # A matrix would be a better container for this one.
+    dist_matrix = np.array([[0, 10, 18, 15],
+                            [10, 0, 15, 18],
+                            [18, 15, 0, 10],
+                            [15, 18, 10, 0]])
+
+    decay_rates = {'1': 0.020, '2': 0.010, '3': 0.005}
+    robot_no = 0
+    batt_consumed_per_time = (0.10, 0.01) #Batt consumed: travel time, restoration time
+    f_thresh = (80, 50) #Safe threshold; Crit threshold
+
+    # Dec steps = 3
+    dec_steps = 3
+    print("Integer programming decision making:", dec_steps)
+    IntegerProgrammingDecision('intprogram_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=batt_consumed_per_time, f_thresh=f_thresh).run_operation(dec_steps=dec_steps, restoration=0.10)
+
+    # #Dec steps = 2
+    # dec_steps = 2
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02, safe_fmeasure=80)
+    #
+    # #Dec steps = 3
+    # dec_steps = 3
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02, safe_fmeasure=80)
+    #
+    # Dec steps = 4
+    # dec_steps = 4
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02, safe_fmeasure=80)
+    #
+    # Dec steps = 6
+    # dec_steps = 6
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02, safe_fmeasure=80)
+
+    # dec_steps = 10
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0,
+    #                   batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02,
+    #                                                              safe_fmeasure=80)
+
+    # duration_matrix = np.array([[0, 13.978, 33.8757, 47.92],
+    #                                 [17.521, 0, 27.4774, 48.695],
+    #                                 [33.827, 22.955, 0, 49.973],
+    #                                 [57.22, 49.53, 56.535, 0]])

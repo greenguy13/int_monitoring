@@ -1,0 +1,52 @@
+#!/usr/bin/env python
+
+"""
+Charges up the battery of the robot [WORK]
+
+1. Inputs:
+> Receives action request from motion/robot to charge up its battery
+
+2. Process:
+> Charges up the battery of robot. There is some delay before the battery of robot is fully-charged up
+
+3. Output
+> Sends notification to motion/robot that action request for charging up is done
+
+"""
+import math
+import rospy
+import actionlib
+from intermittent_monitoring.msg import charge_batteryAction, charge_batteryFeedback, charge_batteryResult
+
+class ChargingStation():
+    def __init__(self, node_name, max_battery, restoration):
+        rospy.init_node(node_name)
+        #self.delay_charge = 2 #Delay in charging
+        self.max_battery = max_battery
+        self.restoration = restoration
+        #Action server: Charge up battery (requested by motion)
+        self.charge_battery_server = actionlib.SimpleActionServer("charge_battery_server", charge_batteryAction, execute_cb = self.charge_battery_cb, auto_start=False)
+        self.charge_battery_server.start()
+
+    def charge_battery_cb(self, goal):
+        """
+        Callback as action server to charge up battery. Simply sets a delay in charging the robot up
+        :param goal:
+        :return:
+        """
+
+        charge_feedback = charge_batteryFeedback()
+        charge_result = charge_batteryResult()
+        rate = rospy.Rate(1)
+        delay_charge = math.ceil(self.restoration * (self.max_battery - goal.curr_batt_level))
+        for i in range(delay_charge):
+            charge_feedback.charging_battery = "Charging battery..."
+            self.charge_battery_server.publish_feedback(charge_feedback)
+            rate.sleep()
+
+        charge_result.battery_charged = True
+        self.charge_battery_server.set_succeeded(charge_result)
+
+if __name__ == '__main__':
+    charging_station = ChargingStation('charging_station', max_battery=100, restoration=0.10)
+    rospy.spin()

@@ -1,0 +1,3 @@
+bool batt_level_request
+---
+float32 batt_level

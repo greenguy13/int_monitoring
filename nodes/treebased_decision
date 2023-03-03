@@ -1,0 +1,455 @@
+#!/usr/bin/env python
+
+"""
+Tree-based decision making
+
+    Given all feasible areas and not in safe zone for the next k decision steps:
+    Process:
+        1. Stack all the combination of length k
+        2. Compute cost
+        3. Pick the least cost
+"""
+import time
+import random as rd
+import numpy as np
+import rospy
+import actionlib
+from intermittent_monitoring.msg import visitAction, visitGoal
+from intermittent_monitoring.srv import flevel, flevelRequest
+from intermittent_monitoring.srv import location, locationRequest
+from intermittent_monitoring.srv import battery_level, battery_levelRequest
+from intermittent_monitoring.loss_fcns import *
+from intermittent_monitoring.cost_fcns import *
+from intermittent_monitoring.pruning import *
+
+
+def request_battery_level(robot_no, msg=True):
+    """
+    Service request for current battery level of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("battery_server_" + str(robot_no))
+    battery_service = rospy.ServiceProxy("battery_server_" + str(robot_no), battery_level)
+    request = battery_levelRequest(msg)
+    result = battery_service(request)
+    # print("Received from server current battery:", result.batt_level)
+    return result.batt_level
+
+def request_fmeasure(area, msg=True):
+    """
+    Service request for F-measure
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("flevel_server_" + str(area))
+    flevel_service = rospy.ServiceProxy("flevel_server_" + str(area), flevel)
+    request = flevelRequest(msg)
+    result = flevel_service(request)
+    # print("Received from server current Fmeasure:", result.current_fmeasure)
+    return result.current_fmeasure
+
+def request_location(robot_no, msg=True):
+    """
+    Service request for current location of robot (or motion)
+    :param msg:
+    :return:
+    """
+    rospy.wait_for_service("location_server_" + str(robot_no))
+    location_service = rospy.ServiceProxy("location_server_" + str(robot_no), location)
+    request = locationRequest(msg)
+    result = location_service(request)
+    # print("Received from server current location:", result.current_location)
+    return result.current_location
+
+def request_visit_feedback_cb(msg):
+    """
+    Feedback for action request to visit an area
+    :param msg:
+    :return:
+    """
+    print('Feedback received:', msg)
+
+def request_visit(robot_no, area):
+    """
+    Action request (to motion) to visit an area: either an area to monitor or a charging station.
+    If area monitor, request consists of visiting the area and restoring the F-measure.
+    But if a charging station, request consists of visiting the area and charging up the robot's battery.
+    :param area: Area to visit (either to monitor or charge up if charging station)
+    :return: True if request has been complied by robot (or motion)
+    """
+    client = actionlib.SimpleActionClient('visit_action_server_' + str(robot_no), visitAction)
+    client.wait_for_server()
+    goal = visitGoal()
+    goal.area = area
+    client.send_goal(goal, feedback_cb=request_visit_feedback_cb)
+    client.wait_for_result()
+    result = client.get_result() #Here we want this to be an array of actual parameters after travel/assignment
+    return result
+
+class TreeBasedDecision():
+    def __init__(self, node_name, decay_rates_dict, est_distance_matrix, robot_no, robot_velocity, batt_consumed_per_time, f_thresh):
+        """
+
+        :param node_name:
+        :param areas:
+        :param est_distance_matrix:
+        :param est_batt_consumption_matrix:
+        """
+        rospy.init_node(node_name)
+        self.areas = list(decay_rates_dict.keys())
+        global cast
+        cast = type(self.areas[0])
+        self.charging_station = cast(0)  # charging station area index
+
+        self.decay_rates_dict = decay_rates_dict #Decay rate of areas
+        self.est_distance_matrix = est_distance_matrix #We can actually add a random noise
+        self.max_distance = np.max(self.est_distance_matrix) #Max distance between two areas
+        self.robot_no = robot_no
+        self.robot_velocity = robot_velocity #Linear velocity of robot; we assume linear and angular are relatively equal
+
+        # These can be stored as rospy params
+        self.max_fmeasure = 100  # Max F-measure of an area
+        self.max_battery = 100 #Max battery
+        self.fsafe = f_thresh[0] #safe threshold
+        self.fcrit = f_thresh[1] #crit threshold
+
+        # We can make this more accurate by having battery consumption per unit time for the travel distance and then another for the restoration
+        self.batt_consumed_per_travel_time = batt_consumed_per_time[0] # Battery consumed per unit distance travelled
+        self.batt_consumed_per_restored_f = batt_consumed_per_time[1] # Battery consumed per unit F restored
+    def compute_duration(self, start_area, next_area, curr_measure, restoration, noise):
+        """
+        Computes (time) duration of operation, which includes travelling distance plus restoration, if any
+        Furthermore, we include the battery consumed
+        :param distance:
+        :param restoration: restore a measure (if not None) back to full measure
+        :param noise: expected noise in distance travelled
+        :return:
+        """
+
+        # Travel distance
+        distance = self.est_distance_matrix[int(start_area), int(next_area)]
+        distance += noise * distance #distance + noise
+        time = (distance / self.robot_velocity)
+
+        #If next area is not the charging station: the restoration is the f-measure; else, the restoration is the battery level
+        if next_area != self.charging_station:
+            max_restore = self.max_fmeasure
+        else:
+            max_restore = self.max_battery
+
+        #Restoration time: If there is need for restoration
+        if (curr_measure is not None) and (restoration is not None):
+            restore_time = restoration * (max_restore - curr_measure)
+            time += restore_time
+
+        return time
+
+
+    def consume_battery(self, start_area, next_area, curr_measure, noise):
+        """
+        Consumes curr_battery for the duration of the operation.
+        This duration includes the distance plus F-measure restoration, if any
+        :param curr_battery:
+        :param duration:
+        :return:
+        """
+
+        #Batt consumed in travel
+        distance = self.est_distance_matrix[int(start_area), int(next_area)]
+        distance += noise * distance  # distance + noise
+        travel_time = (distance / self.robot_velocity)
+        battery_consumed = self.batt_consumed_per_travel_time * travel_time
+
+        if next_area != self.charging_station:
+            battery_consumed += self.batt_consumed_per_restored_f * (self.max_fmeasure - curr_measure)
+
+        return battery_consumed
+
+
+    def adjust_fmeasures(self, fmeasures, visit_area, duration):
+        """
+        Adjusts the F-measures of all areas. The visit area will be restored to max, while the other areas will decay for
+        t duration. Note that the charging station is not part of the areas to monitor. And so, if the visit_area is the
+        charging station, then all of the areas will decay as duration passes by.
+        :param fmeasures:
+        :param visit_area:
+        :param t:
+        :return:
+        """
+        for area in self.areas:
+            if area == visit_area:
+                fmeasures[area] = self.max_fmeasure
+            else:
+                tlapse_decay = get_time_given_decay(self.max_fmeasure, fmeasures[area], self.decay_rates_dict[area]) + duration
+                fmeasures[area] = decay(self.decay_rates_dict[area], tlapse_decay, self.max_fmeasure)
+
+        return fmeasures
+
+    def grow_tree(self, dec_steps, restoration, noise):
+        """
+        We grow a decision tree of depth dec_steps starting from where the robot is.
+        :param curr_location: current location of robot
+        :param dec_steps: number of decision steps, (i.e., tree depth)
+        :param restoration: duration it takes to restore per unit F-measure
+        :param noise: anticipated noise in actual travel to an area
+        :return:
+        """
+        #NOTE: WE NEED TO UPDATE IN THE PRUNING SUCH THAT THE ROBOT WILL NOT DIE IN THE MISSION/DURING THE OPERATION
+
+        branches = list() #container for final branches up to depth k
+        to_grow = list()  #container for branches still being grown/expanded
+        nodes = self.areas[:]
+        print("Nodes prior cast:", nodes)
+        #cast = type(nodes[0])
+        nodes.append(cast(self.charging_station)) #append the charging station
+        print("Nodes:", nodes)
+
+        #Start at the current location as the root node.
+        fmeasures = dict() #F-measures of areas
+        print("Areas:", self.areas)
+        for area in self.areas:
+            fmeasures[area] = float(request_fmeasure(area))
+        print("Fmeasures:", fmeasures)
+        k = 0
+        curr_location = request_location(self.robot_no)
+        path = [cast(curr_location)]
+        battery = request_battery_level(self.robot_no)
+        cost = 0 #Initialize cost of path
+
+        #Initial feasible battery level
+        feasible_battery_consumption = self.consume_battery(start_area=cast(curr_location), next_area=self.charging_station,
+                                                            curr_measure=None, noise=noise)
+        feasible_battery = battery - feasible_battery_consumption
+
+        branch = (path, battery, fmeasures, cost, feasible_battery)
+        to_grow.append(branch)
+
+        #Succeeding decision steps:
+        while k < dec_steps:
+            print("\n Dec step:", k)
+            consider_branches = to_grow[:]
+            to_grow = list() #At the end of the iterations, to-grow will be empty while branches must be complete
+            for branch in consider_branches:
+                print("Branch to grow:", branch)
+                considered_growing= 0 #Indicators whether the branch has been considered for growing
+                for i in range(len(nodes)):
+                    # Hypothetical: What if we travel to this area, what will the consumed battery be and the updated F-fmeasures?
+                    # Shall we prune this in the next decision step?
+                    start_area = path[-1]
+                    next_area = nodes[i]
+                    path = branch[0][:]  # path at depth k
+                    battery = branch[1]  # battery level at depth k
+                    fmeasures = branch[2].copy()  # current fmeasures at depth k
+                    cost = branch[3] # cost of path at depth k
+
+                    #Need to compute duration to go back to charging station from next_area
+                    #We would then store it as feasible battery which will be needed for breaking ties in sorting later
+                    if next_area != cast(self.charging_station):
+                        curr_measure = fmeasures[next_area]
+                        tlapse_decay = get_time_given_decay(self.max_fmeasure, curr_measure, self.decay_rates_dict[next_area])
+                        decayed_fmeasure = decay(self.decay_rates_dict[next_area], tlapse_decay, self.max_fmeasure) #Decayed measure of area if we travel there
+                        duration = self.compute_duration(start_area=start_area, next_area=next_area, curr_measure=curr_measure, restoration=restoration, noise=noise) #Duration if we preserve area
+                    else:
+                        curr_measure, tlapse_decay, decayed_fmeasure = None, None, None
+                        duration = self.compute_duration(start_area=start_area, next_area=self.charging_station, curr_measure=battery, restoration=restoration, noise=noise) #Duration if we charge up
+
+                    #Battery consumption
+                    battery_consumption = self.consume_battery(start_area=start_area, next_area=next_area, curr_measure=curr_measure, noise=noise)
+                    battery_consumption_backto_charging_station = self.consume_battery(start_area=next_area, next_area=self.charging_station, curr_measure=None, noise=noise)
+                    feasible_battery_consumption = battery_consumption + battery_consumption_backto_charging_station
+
+                    print("Next area: {}, Batt level: {}, Duration: {}, Batt consumption: {}, Decayed fmeasure: {}, TLapse decay: {}".format(next_area, battery, duration, battery_consumption, decayed_fmeasure, tlapse_decay))
+                    # If branch is not to be pruned and length still less than dec_steps,
+                    # then we continue to grow that branch
+
+                    if (prune(battery, feasible_battery_consumption, decayed_fmeasure, self.fsafe) is False and (k < dec_steps)) or next_area == cast(self.charging_station): #TO-DO. Ok
+                        # IDEA: If the next area is the charging station, we assume that the robot can always go back
+                        path.append(next_area) #append next area as part of the path at depth k+1. #This is where the additional or overwriting happens. We need to make dummy list/container
+                        if next_area != cast(self.charging_station):
+                            battery -= battery_consumption #actual battery depleted at depth k+1
+                        else:
+                            battery = self.max_battery #actual battery restored to max value
+                        feasible_battery = battery - feasible_battery_consumption  # battery available after taking into account battery to go back to charging station from current location
+                        updated_fmeasures = self.adjust_fmeasures(fmeasures, next_area, duration) #F-measure of areas adjusted accordingly
+                        cost += self.compute_cost_path(updated_fmeasures)
+                        print("Branch to grow appended:", (path, battery, updated_fmeasures, cost, feasible_battery))
+                        to_grow.append((path, battery, updated_fmeasures, cost, feasible_battery)) #Branch: (path, battery, updated_fmeasures, cost, feasible battery)
+                        considered_growing += 1
+
+
+
+                    #Else, we add that branch to branches (for return)
+                    else:
+                        # We need to make sure that the robot is not dead at the end of the operations, i.e.,
+                        #   we check whether remaining feasible battery >= 0. If not, then this path ends dead, thus we don't append it
+                        # Furthermore: If after iterating through possible nodes branch not considered for growing, and not yet in branches
+                        if (is_feasible(battery, feasible_battery_consumption) is True) and (i == len(nodes)-1 and considered_growing == 0) and (branch not in branches):
+                            print("Branch appended to tree:", branch)
+                            branches.append(branch)
+
+                        #We need to check whether the branches are empty or not. We need to send the robot home.
+            k += 1 #We are done with k depth, so move on to the next depth
+
+        #We append to branches the branches of length k, (i.e., the final decision step)
+        print("We arrived at last decision step!")
+        for branch in to_grow:
+            if branch not in branches:
+                branches.append(branch)
+        return branches
+
+    def compute_cost_path(self, fmeasures):
+        """
+        Computes the cost, (i.e., the sum of losses) of the path
+        :param fmeasures:
+        :return:
+        """
+
+        """
+        Steps:
+        1. Computes the loss for each of the F-measure of the areas
+        2. Sums up the losses to get the cost of the branch
+        """
+        #for area in list(values)
+
+        cost = compute_cost_fmeasures(fmeasures, self.fsafe, self.fcrit)
+
+        return cost
+
+    def get_optimal_branch(self, tree):
+        """
+        Returns the optimal branch of the tree. This shall be the optimal decision path for the robot
+        :param tree:
+        :return:
+        """
+
+        """
+        Steps:
+        1. Sorts the branches of the tree by the accumulated cost, breaking ties by battery level, potentially feasible battery
+        2. Returns the optimal path
+        
+        Nuances:
+        What if the length is not of decision steps?
+            > We resolve this in tree() where we decide whether to include in a branch
+        """
+
+        #Sort the branches of length k: the cost is key while the value is branch
+        sorted_branches = sorted(tree, key = lambda x: (x[-2], -x[-1]))
+        print("Branches sorted by cost:")
+        for branch in sorted_branches:
+            print(branch)
+        print("Optimal branch (branch info + cost):", sorted_branches[0])
+        optimal_path = sorted_branches[0][0]
+
+        return optimal_path
+
+
+
+
+    def run_operation(self, dec_steps, restoration, noise):
+        """
+        Among the feasible areas, pick randomly the next area to monitor
+        :return:
+        """
+        try:
+            while True:
+                st = time.time()
+                time.sleep(1)
+
+                """
+                DO: Set a switch here to stop the area from decaying
+                """
+
+                tree = self.grow_tree(dec_steps, restoration, noise)
+                tree_et = time.time()
+                optimal_path = self.get_optimal_branch(tree)
+                opt_path_et = time.time()
+
+                print("Tree ({} dec steps): {}".format(dec_steps, tree))
+                print("Optimal path:", optimal_path)
+                print("Wall time (secs). Build tree: {}. Opt path: {}. Total: {}".format(tree_et - st, opt_path_et - st, (tree_et - st) + (opt_path_et - st)))
+
+                """
+                DO: Switch on the ticking of decay here
+                """
+                #NOTE: The path stores the root. And so the first element should not be included as an action goal
+                for step in range(len(optimal_path)-1):
+                    area = optimal_path[step+1]
+                    print("Requested visit:", area)
+                    result_params = request_visit(self.robot_no, int(area))
+
+                    """
+                    #DO: Record the result_params
+                    #Update the belief on the duration of the navigation plus the decay rates/function (if applicable) for that specific area
+                    #Update the belief of the duration of the navigation
+                    ##This includes the distance/duration plus the epsilon (noise)
+
+                    # Update the decay function
+                    if area is not self.charging_station:
+                        pass
+                    """
+
+                    actual_travel_distance = result_params[-2]
+                    actual_travel_duration = result_params[-1]
+                    duration_restoration = result_params[0]
+
+                    if area != self.charging_station:
+                        batt_consumed_travel = result_params[1]
+                        actual_fmeasure = result_params[2]
+
+                    #DO: Request and store F-measure of areas here
+                    #We then store the results. Ideally: If we collected enough F, we send a switch to kill the operation or rospy.shutdown().
+                    #In fact, if we want multiple simulation, we restart the simulation to the next.
+
+        except rospy.ROSInterruptException as e:
+            print('Something went wrong', e)
+
+if __name__ == '__main__':
+    # To-gather: motion. duration of travel. Yes. We indeed need a prior program that gathers the information on cost of operation.
+    # A matrix would be a better container for this one.
+    dist_matrix = np.array([[0, 10, 18, 15],
+                            [10, 0, 15, 18],
+                            [18, 15, 0, 10],
+                            [15, 18, 10, 0]])
+
+    batt_consumed_per_time = (0.10, 0.01) #Batt consumed: travel time, restoration time
+    f_thresh = (80, 50) #Thresholds: F-safe, F-crit
+    decay_rates = {'1': 0.020, '2': 0.010, '3': 0.005}
+    robot_no = 0
+    rd.seed(1234)
+
+    #Dec steps = 1
+    # dec_steps = 1
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.25, safe_fmeasure=80)
+
+    # #Dec steps = 2
+    # dec_steps = 2
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02, safe_fmeasure=80)
+    #
+    #Dec steps = 3
+    dec_steps = 3
+    print("Tree-based decision making:", dec_steps)
+    TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=batt_consumed_per_time, f_thresh=f_thresh).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02)
+    #
+    #Dec steps = 4
+    # dec_steps = 4
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02, safe_fmeasure=80)
+    #
+    #Dec steps = 6
+    # dec_steps = 6
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0, batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02, safe_fmeasure=80)
+
+    # dec_steps = 10
+    # print("Tree-based decision making:", dec_steps)
+    # TreeBasedDecision('treebased_decision', decay_rates, dist_matrix, robot_no, robot_velocity=1.0,
+    #                   batt_consumed_per_time=0.25).run_operation(dec_steps=dec_steps, restoration=0.10, noise=0.02,
+    #                                                              safe_fmeasure=80)
+
+    # duration_matrix = np.array([[0, 13.978, 33.8757, 47.92],
+    #                                 [17.521, 0, 27.4774, 48.695],
+    #                                 [33.827, 22.955, 0, 49.973],
+    #                                 [57.22, 49.53, 56.535, 0]])

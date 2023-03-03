@@ -1,0 +1,10 @@
+# Goal
+int32 max_fmeasure
+
+---
+# Result
+bool raised_max
+
+---
+# Feedback
+string current_fmeasure
